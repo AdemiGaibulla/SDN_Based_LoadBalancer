@@ -9,9 +9,9 @@ from ryu.lib.packet import packet, ethernet, ipv4, arp
 VIRTUAL_IP = '10.0.0.10'
 VIRTUAL_MAC = '00:00:00:00:00:10'
 SERVERS = [
+    {'ip' : '10.0.0.1', 'mac' : '00:00:00:00:00:01'},
     {'ip' : '10.0.0.2', 'mac' : '00:00:00:00:00:02'},
-    {'ip' : '10.0.0.3', 'mac' : '00:00:00:00:00:03'},
-    {'ip' : '10.0.0.4', 'mac' : '00:00:00:00:00:04'}
+    {'ip' : '10.0.0.3', 'mac' : '00:00:00:00:00:03'}
 ]
 
 class LoadBalancer(app_manager.RyuApp):
@@ -22,7 +22,6 @@ class LoadBalancer(app_manager.RyuApp):
         self.mac_to_port = {}
         self.current_server = -1
         self.server_rqst_count = [0,0,0]
-        self.selected_server = None
         self.rqst_count = 0
 
     def add_flow(self, datapath, priority, match, actions):
@@ -48,16 +47,13 @@ class LoadBalancer(app_manager.RyuApp):
         return server
 
     def arp_handler(self, datapath, in_port, eth_pkt, arp_pkt, parser, ofproto):
-        self.selected_server = self.next_server()
-        reply_mac = self.selected_server['mac']
-
         reply = packet.Packet()
         reply.add_protocol(ethernet.ethernet(ethertype=0x0806,
                                             dst=eth_pkt.src,
-                                            src=reply_mac))
+                                            src=VIRTUAL_MAC))
         reply.add_protocol(arp.arp(opcode=arp.ARP_REPLY,
-                                   src_mac=reply_mac, src_ip=VIRTUAL_IP,
-                                    dst_mac=arp_pkt.src_mac, dst_ip=arp_pkt.src_ip))
+                                   src_mac=VIRTUAL_MAC, src_ip=VIRTUAL_IP,
+                                   dst_mac=arp_pkt.src_mac, dst_ip=arp_pkt.src_ip))
         reply.serialize()
 
         out = parser.OFPPacketOut(datapath=datapath, 
@@ -68,7 +64,7 @@ class LoadBalancer(app_manager.RyuApp):
         datapath.send_msg(out)
 
     def ip_handler(self, datapath, in_port, eth_pkt, ip_pkt, parser, ofproto, msg):
-        server = self.selected_server
+        server = self.next_server()
         if server['mac'] in self.mac_to_port:
             out_port = self.mac_to_port[server['mac']]
         else:
@@ -77,19 +73,23 @@ class LoadBalancer(app_manager.RyuApp):
         actions = [parser.OFPActionSetField(ipv4_dst=server['ip']),
                    parser.OFPActionSetField(eth_dst=server['mac']),
                    parser.OFPActionOutput(out_port)]
-        
-        if out_port != ofproto.OFPP_FLOOD:
-            match = parser.OFPMatch(in_port=in_port, eth_type=0x0800, ipv4_dst=VIRTUAL_IP)
-            self.add_flow(datapath, 100, match, actions)
+        match = parser.OFPMatch(in_port=in_port, eth_type=0x0800, 
+                                                 ipv4_dst=VIRTUAL_IP)
+        self.add_flow(datapath, 10, match, actions)
+
+        actions_back = [parser.OFPActionSetField(eth_src=VIRTUAL_MAC),
+                        parser.OFPActionSetField(ipv4_src=VIRTUAL_IP),
+                        parser.OFPActionOutput(in_port)]
+        match_back = parser.OFPMatch(in_port=out_port, eth_type=0x0800,
+                                     ipv4_src=server['ip'], ipv4_dst=ip_pkt.src)
+        self.add_flow(datapath, 10, match_back, actions_back)
 
         out = parser.OFPPacketOut(datapath=datapath,
-                                  buffer_id=ofproto.OFP_NO_BUFFER,
+                                  buffer_id=msg.buffer_id,
                                   in_port=in_port,
                                   actions=actions,
                                   data=msg.data)
         datapath.send_msg(out)
-
-        
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
@@ -114,6 +114,19 @@ class LoadBalancer(app_manager.RyuApp):
         if ip_pkt and ip_pkt.dst == VIRTUAL_IP:
             self.ip_handler(dp, in_port, eth_pkt, ip_pkt, ofp_parser, ofp,msg)
             return
+
+        if eth_pkt.dst in self.mac_to_port:
+            out_port = self.mac_to_port[eth_pkt.dst]
+        else:
+            out_port = ofp.OFPP_FLOOD
+
+        actions = [ofp_parser.OFPActionOutput(out_port)]
+        out = ofp_parser.OFPPacketOut(datapath=dp,
+                                  buffer_id=msg.buffer_id,
+                                  in_port=in_port,
+                                  actions=actions,
+                                  data=msg.data)
+        dp.send_msg(out)
 
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
